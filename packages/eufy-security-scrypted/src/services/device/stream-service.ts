@@ -84,7 +84,7 @@ export class StreamService {
   getVideoStreamOptions(quality?: VideoQuality): ResponseMediaStreamOptions[] {
     const { width, height } = this.getVideoDimensions(quality);
     const codec = FFmpegUtils.toScryptedCodec(
-      this.streamServer.getVideoMetadata()?.videoCodec ?? "H264",
+      this.streamServer.getVideoMetadata()?.videoCodec ?? "H265",
     );
 
     return [
@@ -181,9 +181,10 @@ export class StreamService {
   ): Promise<MediaObject> {
     const { width, height } = this.getVideoDimensions(quality);
 
-    // Detect codec from last received stream metadata; default to H264
+    // Detect codec from last received stream metadata; default to H265
+    // (hardcoded for this camera model, which is always H265 - see note)
     const eufyCodec =
-      this.streamServer.getVideoMetadata()?.videoCodec ?? "H264";
+      this.streamServer.getVideoMetadata()?.videoCodec ?? "H265";
     const scryptedCodec = FFmpegUtils.toScryptedCodec(eufyCodec); // "h264" or "h265"
 
     // Use the muxed fMP4 port if available. The stream server runs an
@@ -194,6 +195,37 @@ export class StreamService {
     // RTSP works without any extradata dance.
     const muxedPort = this.streamServer.getMuxedPort();
     const useMuxed = !!muxedPort;
+
+    // Pass through what the caller actually asked for (bitrate/
+    // resolution/fps/profile) so the H.265 transcode pipeline can match
+    // it instead of always encoding with one fixed configuration.
+    // Confirmed via a real HomeKit plugin log to matter concretely: HAP
+    // negotiated MAIN profile / 1280x720 / 30fps / 299kbps for a given
+    // session, but without this the transcode always sent Baseline /
+    // 1920x1080 / ~1000kbps regardless - over 3x the bitrate budget -
+    // and since HomeKit does `-vcodec copy` with no re-encoding of its
+    // own, that mismatch reached the client as-is.
+    if (useMuxed) {
+      this.streamServer.setNextTranscodeOptions({
+        bitrate: options?.video?.bitrate,
+        width: options?.video?.width ?? options?.video?.clientWidth,
+        height: options?.video?.height ?? options?.video?.clientHeight,
+        fps: options?.video?.fps,
+        profile: options?.video?.profile,
+      });
+    }
+
+    // The muxed port's output codec is always H.264, regardless of the
+    // camera's native codec: eufy-stream-server's handleMuxedClient either
+    // passes H.264 through unchanged (attachJMuxerClient) or transcodes
+    // H.265 -> H.264 (attachTranscodeClient) before it ever reaches this
+    // port. Reporting the native `scryptedCodec` (which can be "h265")
+    // here made Scrypted's WebRTC plugin believe the stream was still
+    // H.265 and build its own redundant second H.264 transcode on top of
+    // ours - two lossy compression passes stacked, visibly degrading
+    // quality. The raw (non-muxed) port below still carries the camera's
+    // real native codec, so that path is unaffected.
+    const outputCodec = useMuxed ? "h264" : scryptedCodec;
 
     const inputArguments = useMuxed
       ? [
@@ -236,10 +268,10 @@ export class StreamService {
         name: options?.name || "Eufy Camera Stream",
         container: useMuxed ? "mp4" : options?.container,
         video: {
-          codec: scryptedCodec,
           width,
           height,
           ...options?.video,
+          codec: outputCodec,
         },
         ...(useMuxed && { audio: { codec: "aac" } }),
       },

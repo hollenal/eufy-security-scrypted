@@ -64,7 +64,7 @@ export class SnapshotService {
 
       // Detect codec from last received stream metadata (H264 or H265)
       const videoCodec =
-        this.streamServer.getVideoMetadata()?.videoCodec ?? "H264";
+        this.streamServer.getVideoMetadata()?.videoCodec ?? "H265";
 
       // Convert keyframe to JPEG using FFmpeg
       const jpegBuffer = await FFmpegUtils.convertH264ToJPEG(

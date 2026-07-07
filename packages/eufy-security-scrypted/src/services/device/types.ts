@@ -55,4 +55,21 @@ export interface IStreamServer {
    * Returns undefined if not started.
    */
   getMuxedPort(): number | undefined;
+
+  /**
+   * Hint the transcode pipeline about what the NEXT muxed-port
+   * connection actually needs (bitrate/resolution/fps), so a
+   * per-session-mismatched fixed encode isn't blindly sent regardless
+   * of what was negotiated. Consumed once by the next connection, then
+   * cleared - callers should set this immediately before the resulting
+   * TCP connection is expected (e.g. right when returning the
+   * FFmpegInput that points at the muxed port).
+   */
+  setNextTranscodeOptions(opts: {
+    bitrate?: number;
+    width?: number;
+    height?: number;
+    fps?: number;
+    profile?: string;
+  }): void;
 }

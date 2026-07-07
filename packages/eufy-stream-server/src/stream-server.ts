@@ -8,8 +8,10 @@
  */
 
 import * as net from "node:net";
+import * as fs from "node:fs";
 import { EventEmitter } from "node:events";
 import { Duplex } from "node:stream";
+import { spawn, ChildProcessWithoutNullStreams } from "node:child_process";
 import JMuxer from "jmuxer";
 import { Logger, ILogObj } from "tslog";
 import { ConnectionManager } from "./connection-manager";
@@ -75,13 +77,22 @@ export class StreamServer extends EventEmitter {
   private server?: net.Server;
   private muxedServer?: net.Server;
   /**
-   * Map of muxed-client socket → its dedicated JMuxer instance. Each
-   * connection gets its own muxer so every consumer receives a complete
-   * fMP4 init segment at the start of its stream.
+   * Map of muxed-client socket → its dedicated output pipeline. Cameras
+   * that deliver H.264 use an in-process JMuxer (fast, no subprocess).
+   * Cameras that deliver H.265 (e.g. the SoloCam S340) go through a real
+   * ffmpeg transcode pipeline instead, since JMuxer only understands
+   * H.264 NAL structure and silently produces no output for H.265 input
+   * (confirmed against JMuxer's own documented input format).
    */
   private muxerStreams = new Map<
     net.Socket,
-    { muxer: JMuxer; duplex: Duplex }
+    | { kind: "jmuxer"; muxer: JMuxer; duplex: Duplex }
+    | {
+        kind: "transcode";
+        proc: ChildProcessWithoutNullStreams;
+        videoPipe: NodeJS.WritableStream;
+        audioPipe: NodeJS.WritableStream;
+      }
   >();
   private connectionManager: ConnectionManager;
   private h264Parser: H264Parser;
@@ -127,6 +138,16 @@ export class StreamServer extends EventEmitter {
   private cachedSPS: Buffer | null = null;
   private cachedPPS: Buffer | null = null;
   private cachedVPS: Buffer | null = null; // H.265 Video Parameter Set
+
+  // See IStreamServer.setNextTranscodeOptions - per-request hints for
+  // the next H.265 transcode connection (bitrate/resolution/fps).
+  private nextTranscodeOptions: {
+    bitrate?: number;
+    width?: number;
+    height?: number;
+    fps?: number;
+    profile?: string;
+  } | null = null;
 
   constructor(options: StreamServerOptions) {
     super();
@@ -389,9 +410,13 @@ export class StreamServer extends EventEmitter {
         // livestream while muxer clients are actively consuming it.
         if (this.muxerStreams.size > 0) {
           this.lastClientActivity = Date.now();
-          for (const { muxer } of this.muxerStreams.values()) {
+          for (const entry of this.muxerStreams.values()) {
             try {
-              muxer.feed({ video: videoBuffer });
+              if (entry.kind === "jmuxer") {
+                entry.muxer.feed({ video: videoBuffer });
+              } else {
+                entry.videoPipe.write(videoBuffer);
+              }
             } catch (e) {
               this.logger.warn(`Muxer video feed error: ${e}`);
             }
@@ -456,9 +481,13 @@ export class StreamServer extends EventEmitter {
           return;
         }
 
-        for (const { muxer } of this.muxerStreams.values()) {
+        for (const entry of this.muxerStreams.values()) {
           try {
-            muxer.feed({ audio: audioBuffer });
+            if (entry.kind === "jmuxer") {
+              entry.muxer.feed({ audio: audioBuffer });
+            } else {
+              entry.audioPipe.write(audioBuffer);
+            }
           } catch (e) {
             this.logger.warn(`Muxer audio feed error: ${e}`);
           }
@@ -639,7 +668,31 @@ export class StreamServer extends EventEmitter {
    * matches what the Eufy cameras actually deliver byte-for-byte.
    */
   private handleMuxedClient(socket: net.Socket): void {
-    const videoFps = this.videoMetadata?.videoFPS ?? 15;
+    // Detect actual camera codec. Falls back to H265 because the only
+    // camera this fork has been verified against (SoloCam S340) is
+    // always H265, and metadata may not have arrived yet on a cold
+    // start. If you use this against a confirmed H.264 camera, change
+    // this fallback back to "H264".
+    const eufyCodec = this.videoMetadata?.videoCodec ?? "H265";
+    const isH265 = eufyCodec.toUpperCase().includes("265");
+
+    if (isH265) {
+      this.attachTranscodeClient(socket);
+    } else {
+      // `|| 15`, not `?? 15`: this camera has been confirmed (via direct
+      // metadata dump) to report videoFPS as a literal 0, not
+      // null/undefined - `??` doesn't fall back on 0, so it would
+      // silently pass fps: 0 to JMuxer otherwise.
+      const videoFps = this.videoMetadata?.videoFPS || 15;
+      this.attachJMuxerClient(socket, videoFps);
+    }
+  }
+
+  /**
+   * H.264 path (unchanged): in-process JMuxer, no subprocess, matches
+   * the Eufy stream byte-for-byte.
+   */
+  private attachJMuxerClient(socket: net.Socket, videoFps: number): void {
     // Always declare both tracks. The muxed client connects BEFORE the
     // first audio frame arrives from Eufy, so `audioMetadata` is null at
     // this point on a cold start; if we picked mode based on it we'd lock
@@ -671,9 +724,9 @@ export class StreamServer extends EventEmitter {
       this.logger.warn(`JMuxer duplex error: ${err.message}`);
     });
 
-    this.muxerStreams.set(socket, { muxer, duplex });
+    this.muxerStreams.set(socket, { kind: "jmuxer", muxer, duplex });
     this.logger.info(
-      `Muxed client attached (total active muxers: ${this.muxerStreams.size})`,
+      `Muxed client attached via JMuxer (total active muxers: ${this.muxerStreams.size})`,
     );
 
     // This is the first consumer of the stream — bring up the livestream
@@ -687,6 +740,467 @@ export class StreamServer extends EventEmitter {
         muxer.destroy();
       } catch (e) {
         this.logger.warn(`JMuxer destroy threw during cleanup: ${e}`);
+      }
+      this.logger.info(
+        `Muxed client detached (total active muxers: ${this.muxerStreams.size})`,
+      );
+      this.updateLivestreamStateForMuxerClients();
+    };
+
+    socket.on("close", cleanup);
+    socket.on("error", cleanup);
+  }
+
+  /**
+   * H.265 path: JMuxer can't mux HEVC (confirmed against its own docs
+   * and issue tracker - it only documents H.264 input). Instead, spawn
+   * a real ffmpeg process that decodes the raw H.265 Annex-B stream and
+   * re-encodes it to H.264, muxing video (fd 3) and audio (fd 4) into a
+   * fragmented MP4 written to stdout.
+   *
+   * Encoder is chosen at runtime based on what hardware is actually
+   * present (see hasV4l2m2mEncoder below), so the same code works both
+   * on a Raspberry Pi (real bcm2835-codec hardware H.264 encoder,
+   * confirmed via /dev/video11 + "Using device /dev/video11, driver
+   * 'bcm2835-codec'" in ffmpeg's own stderr) and on hosts with no
+   * hardware encode path at all (e.g. a VM with a VMware SVGA II
+   * virtual GPU - confirmed no libva driver, no /dev/nvidia*), which
+   * fall back to software libx264. Software encode was measured at
+   * ~215% CPU on a Pi 4 for a single 720p stream (confirmed via `ps
+   * aux` during testing) - unsustainable there, hence not just always
+   * defaulting to libx264 once hardware is available.
+   */
+  private attachTranscodeClient(socket: net.Socket): void {
+    // Consume once - per-request hints (bitrate/resolution/fps/profile)
+    // set by the caller (stream-service.ts) right before this
+    // connection was expected. Without this, every connection got the
+    // exact same fixed encode regardless of what was actually
+    // negotiated for that specific session - confirmed via a real
+    // HomeKit plugin log to be the actual root cause of "spins, then no
+    // reply from camera": HAP's handleStreamRequest negotiated MAIN
+    // profile / 1280x720 / 30fps / max_bit_rate 299 kbps for that
+    // session, but the fixed encoder was unconditionally sending
+    // Baseline / 1920x1080 / ~15fps / ~1000kbps - over 3x the bitrate
+    // budget alone. Since Scrypted's homekit plugin does `-vcodec copy`
+    // with zero re-encoding to match what it negotiated, whatever this
+    // pipeline actually produces IS what the client receives.
+    const requested = this.nextTranscodeOptions;
+    this.nextTranscodeOptions = null;
+
+    // `frag_keyframe` fragments the output MP4 only at keyframes, so the
+    // downstream MP4 demuxer can't hand off any frame until a whole
+    // fragment (= one full GOP) has arrived - it then delivers that
+    // entire GOP as one burst, producing a stutter-then-catch-up cycle
+    // whose PERIOD equals the GOP duration (confirmed: GOP=250 produced
+    // ~17s stutter, GOP=15 @ ~15fps real-time capture produced ~1s
+    // stutter - shrinking the GOP only shrunk the period, it didn't fix
+    // the bursting). `frag_every_frame` decouples fragmentation from
+    // keyframes entirely, flushing a fragment per frame, so delivery is
+    // continuous regardless of GOP size - which then only needs to be
+    // sized for compression efficiency, not smoothness.
+    //
+    // `|| 15`, not `?? 15`: this camera has been confirmed (via direct
+    // metadata dump) to report videoFPS as a literal 0, not
+    // null/undefined - `??` doesn't fall back on 0, which is exactly
+    // why this previously collapsed to a GOP of 1 (all-intra encoding)
+    // before this was fixed.
+    const videoFps = this.videoMetadata?.videoFPS || 15;
+    const gopSize = Math.max(30, Math.round(videoFps * 2));
+
+    // /dev/video11 is the Broadcom bcm2835-codec hardware H.264 encoder
+    // node on a Raspberry Pi (confirmed present on the Pi, confirmed
+    // absent - no /dev/video* at all - on the VM). Presence is a
+    // reasonable proxy for "real hardware encode is available here";
+    // absence means fall back to software.
+    const hasV4l2m2mEncoder = fs.existsSync("/dev/video11");
+
+    // The camera's native resolution is 2880x1616 (confirmed via captured
+    // metadata). libx264 handles that fine, but the Pi 4's hardware H.264
+    // encoder does not - confirmed directly via ffmpeg stderr: it accepts
+    // the device and format negotiation, then fails at
+    // "VIDIOC_STREAMON failed on output context" once real frames arrive,
+    // exiting with no output. The bcm2835-codec hardware encoder block's
+    // supported resolution tops out well below the camera's native size
+    // (its HEVC decoder is far more capable than its H.264 encoder), so
+    // scale down before handing frames to it - to whatever was actually
+    // requested (e.g. HomeKit's clientWidth for the viewing device),
+    // clamped to 1920 as a safe ceiling for this hardware regardless of
+    // what's requested.
+    const hwTargetWidth = Math.min(requested?.width || 1920, 1920);
+    const videoFilter = hasV4l2m2mEncoder
+      ? `scale=${hwTargetWidth}:-2,format=yuv420p`
+      : "format=yuv420p";
+    // Default (used when no per-request bitrate hint is available - e.g.
+    // Rebroadcast's own persistent prebuffer connection, which doesn't
+    // go through the per-HomeKit-session hint path) raised from the
+    // original 1000000: confirmed via direct measurement that the
+    // camera's real native capture rate is ~14.6fps (matches our 15fps
+    // target, not a throttling issue), so perceived low quality/motion
+    // blur at full 1920x1080 was more likely just 1Mbps being too low
+    // for that resolution. 2000000 matches Rebroadcast's own documented
+    // recommendation (1920x1080, 2000Kb/s, Variable Bit Rate) - plain
+    // `-b:v` with no forced min/maxrate already behaves as VBR, not CBR.
+    const bitrate =
+      requested?.bitrate && requested.bitrate > 0
+        ? Math.round(requested.bitrate)
+        : 2000000;
+    // h264_v4l2m2m emits SPS/PPS in-band in the bitstream (confirmed:
+    // the first NAL in the actual encoded sample data is a real SPS,
+    // NAL type 7) but doesn't populate ffmpeg's out-of-band extradata
+    // from it, so the muxer writes an empty `avcC` config box (confirmed
+    // via hex dump: an 8-byte avcC box, i.e. zero payload). MP4/avc1
+    // decoders read avcC to initialize, not in-band NALs, so the
+    // browser had nothing to decode with - hence a black image despite
+    // data genuinely flowing.
+    //
+    // `-bsf:v extract_extradata` alone did NOT fix this (confirmed:
+    // avcC still empty after adding it) - with `empty_moov`, the muxer
+    // writes its header essentially immediately, before any packet (and
+    // therefore before a post-hoc bitstream filter) has run, so
+    // extraction happens too late regardless. `-flags +global_header`
+    // instead changes the ENCODER's own behavior, telling it to
+    // populate extradata proactively at initialization rather than
+    // relying on in-band parameter sets - this is the standard fix for
+    // this exact class of streaming-muxer/hardware-encoder timing
+    // mismatch. Not needed for libx264, which sets extradata correctly
+    // on its own regardless.
+    // Profile matters beyond just device compatibility: Scrypted's
+    // HomeKit plugin does `-vcodec copy` unconditionally for live view
+    // (confirmed by reading its source, plugins/homekit/src/types/
+    // camera/camera-streaming-ffmpeg.ts) - it does not re-encode to
+    // match whatever H.264 profile the Apple client actually negotiated
+    // for that session, it just forwards whatever bytes the source
+    // produces. Use whatever profile was actually requested (now
+    // threaded through via setNextTranscodeOptions); Baseline remains
+    // the fallback default when nothing was specified, since it's the
+    // safest, most universally-supported choice.
+    //
+    // h264_v4l2m2m needs the numeric profile value (66/77/100 =
+    // FF_PROFILE_H264_BASELINE/MAIN/HIGH), not the string form -
+    // confirmed via direct test: the string form fails with "Undefined
+    // constant or missing '(' in 'baseline'" for this specific hardware
+    // encoder wrapper (unlike libx264, which accepts strings directly).
+    const requestedProfile = (requested?.profile || "baseline").toLowerCase();
+    const hwProfileNumeric =
+      requestedProfile === "high"
+        ? "100"
+        : requestedProfile === "main"
+          ? "77"
+          : "66";
+    const swProfileString =
+      requestedProfile === "high"
+        ? "high"
+        : requestedProfile === "main"
+          ? "main"
+          : "baseline";
+
+    const encoderArgs = hasV4l2m2mEncoder
+      ? [
+          "-c:v",
+          "h264_v4l2m2m",
+          "-profile:v",
+          hwProfileNumeric,
+          "-g",
+          String(gopSize),
+          "-b:v",
+          String(bitrate),
+          "-flags",
+          "+global_header",
+        ]
+      : [
+          "-c:v",
+          "libx264",
+          "-profile:v",
+          swProfileString,
+          "-preset",
+          "veryfast",
+          "-tune",
+          "zerolatency",
+          "-g",
+          String(gopSize),
+          "-keyint_min",
+          String(gopSize),
+          "-sc_threshold",
+          "0",
+          "-b:v",
+          String(bitrate),
+        ];
+    // `frag_every_frame` assumes one complete encoded access unit is
+    // available the instant a raw frame is submitted - true for
+    // synchronous software libx264 (confirmed working cleanly on the
+    // VM), but not for h264_v4l2m2m: V4L2 mem2mem hardware encoders
+    // buffer/reorder frames asynchronously internally, so forcing a
+    // fragment flush per input frame can flush before the hardware has
+    // actually finished that frame - confirmed via ffprobe against the
+    // hardware-encoded output: "missing picture in access unit with
+    // size 50" / "No start code is found" (corrupt, undersized AUs),
+    // and a black image in the browser despite the process not
+    // crashing. Time-based fragmentation doesn't require that lockstep
+    // assumption - the muxer just flushes whatever complete frames have
+    // become available within the window.
+    // `delay_moov`: defers writing the initial moov until the first
+    // fragment is actually cut, instead of immediately at muxer open -
+    // needed because h264_v4l2m2m's extradata isn't known until the
+    // hardware has returned an actual encoded frame (a real round trip
+    // through the V4L2 device), which happens after muxer open. Without
+    // this, `-flags +global_header` and `-bsf:v extract_extradata` both
+    // measurably failed to fix the empty avcC box (confirmed via hex
+    // dump both times) because the header was already written before
+    // extradata existed, regardless of what told the encoder/bitstream
+    // to produce it.
+    // `frag_keyframe` added on top of `-frag_duration` for the hardware
+    // path: without it, the very first fragment can get time-cut before
+    // a complete frame has round-tripped through the async hardware
+    // encoder, producing one corrupted, undersized access unit right at
+    // the start of every fresh connection (confirmed via ffprobe: "missing
+    // picture in access unit with size 50" / "no frame!" on cold start,
+    // consistently reproducible, not a one-off probe artifact). Browsers/
+    // WebRTC tolerate that (skip ahead to the next keyframe), but
+    // HomeKit's stricter live pipeline does not - this is what was
+    // producing "spins, then no reply from camera" in the Home app.
+    // `frag_keyframe` guarantees any real keyframe starts a fresh
+    // fragment boundary, so the first fragment is always a complete,
+    // valid frame; `-frag_duration` still handles periodic cuts between
+    // keyframes for continuous delivery during the ~2s GOP.
+    //
+    // The ~3.5s cold-start latency this was briefly suspected of causing
+    // was actually unrelated (confirmed: removing it did not reduce the
+    // latency) - the real cause was ffmpeg's HEVC demuxer waiting for
+    // fresh parameter sets, now fixed above by priming videoPipe with
+    // cached VPS/SPS/PPS immediately on connect.
+    const movflags = hasV4l2m2mEncoder
+      ? "empty_moov+delay_moov+frag_keyframe+default_base_moof"
+      : "frag_every_frame+empty_moov+default_base_moof";
+    const extraMuxArgs = hasV4l2m2mEncoder ? ["-frag_duration", "200000"] : [];
+
+    this.logger.info(
+      `H.265 transcode using ${hasV4l2m2mEncoder ? "hardware (h264_v4l2m2m)" : "software (libx264)"} H.264 encoder`,
+    );
+
+    // The async hardware encoder pipeline occasionally (probabilistically,
+    // not deterministically) produces a corrupted/undersized first access
+    // unit on a fresh connection - confirmed both via our own ffprobe
+    // testing ("missing picture in access unit with size 50") AND, more
+    // importantly, via a REAL HomeKit plugin log showing the exact same
+    // warning ("missing picture in access unit with size 47") from
+    // Scrypted's own `-vcodec copy` ffmpeg reading our muxed output,
+    // immediately followed by that process going completely silent
+    // (zero further reads/writes) until HomeKit's ~30s timeout killed
+    // it. `frag_keyframe` reduces how often this happens but evidently
+    // doesn't eliminate it. Browsers/WebRTC tolerate one bad frame
+    // (skip to the next keyframe) but HomeKit's decoder does not, and
+    // repeatedly hit this across multiple real attempts.
+    //
+    // Mitigation: buffer output from a fresh transcode process instead
+    // of forwarding it immediately. If the corruption signature shows
+    // up in stderr within the buffering window, kill that attempt and
+    // transparently respawn a fresh encoder for the SAME client socket
+    // (the client never sees the failed attempt) - up to a few retries
+    // before giving up and forwarding whatever we have as a last resort.
+    const MAX_TRANSCODE_ATTEMPTS = 3;
+    const CORRUPTION_DETECTION_WINDOW_MS = 1000;
+    const CORRUPTION_PATTERN =
+      /missing picture in access unit|No start code is found/i;
+
+    const spawnAttempt = (attempt: number) => {
+      const spawnTime = Date.now();
+      const proc = spawn(
+        "ffmpeg",
+        [
+          "-hide_banner",
+          "-loglevel",
+          "info",
+          // Raw HEVC piped in has zero container-level timing (no
+          // DTS/PTS), so ffmpeg's demuxer has to observe several frames
+          // spread over real wall-clock time to even estimate a
+          // framerate before it'll commit to declaring "Input #0" -
+          // confirmed via a timestamped stderr timeline that this
+          // probing step alone consumed ~3.4-3.6s of the ~4-7s cold-start
+          // latency, mostly independent of data availability (fixing a
+          // separate missing-cached-headers theory made no measurable
+          // difference). Telling ffmpeg the framerate explicitly and
+          // capping analyzeduration/probesize skips that guessing entirely.
+          "-analyzeduration",
+          "0",
+          "-probesize",
+          "32",
+          "-framerate",
+          String(videoFps),
+          "-f",
+          "hevc",
+          "-i",
+          "pipe:3",
+          // Per-input options in ffmpeg only apply to the input they
+          // precede - the video-side analyzeduration/probesize/framerate
+          // above did NOT carry over to this second input (confirmed:
+          // "Input #0, hevc" dropped to 283ms, but "Input #1, aac" still
+          // took until +4293ms with no override here). Same treatment,
+          // same reasoning, applied to the audio input.
+          "-analyzeduration",
+          "0",
+          "-probesize",
+          "32",
+          "-f",
+          "aac",
+          "-i",
+          "pipe:4",
+          "-vf",
+          videoFilter,
+          ...encoderArgs,
+          // Forces a strictly regular output cadence regardless of any
+          // jitter in when the async hardware encoder actually delivers
+          // frames. Without this, our own muxer logged "Non-monotonic
+          // DTS in output stream 0:0" - a real, confirmed timestamp
+          // irregularity in our own output, always present, separate
+          // from the transient corrupted-first-access-unit issue.
+          // Scrypted's HomeKit "Transcode video" debug mode (full
+          // decode+re-encode) incidentally regenerates clean timestamps
+          // and DOES work despite lower quality - strong evidence this
+          // irregularity, not codec/profile/bitrate correctness (all
+          // independently confirmed already), is what HomeKit's
+          // stricter `-vcodec copy` RTP path can't tolerate.
+          "-r",
+          String(videoFps),
+          "-fps_mode",
+          "cfr",
+          "-c:a",
+          "copy",
+          "-bsf:a",
+          "aac_adtstoasc",
+          "-f",
+          "mp4",
+          "-movflags",
+          movflags,
+          ...extraMuxArgs,
+          "pipe:1",
+        ],
+        { stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] },
+      ) as ChildProcessWithoutNullStreams;
+
+      const rawVideoPipe = proc.stdio[3] as NodeJS.WritableStream;
+      const audioPipe = proc.stdio[4] as NodeJS.WritableStream;
+
+      let firstVideoWriteAt: number | null = null;
+      const videoPipe = {
+        write: (chunk: any) => {
+          if (firstVideoWriteAt === null) {
+            firstVideoWriteAt = Date.now();
+          }
+          return rawVideoPipe.write(chunk);
+        },
+      } as NodeJS.WritableStream;
+
+      // NOTE: previously primed the pipe here by writing cached
+      // VPS/SPS/PPS directly, to address cold-start latency. That
+      // turned out not to be the real latency fix (the analyzeduration/
+      // probesize/framerate flags above were) - and, worse, likely
+      // introduced a separate bug: feeding raw parameter-set NAL units
+      // into the pipe as if they were frame data appears to get muxed
+      // as a spurious, tiny standalone "access unit" (NAL headers, no
+      // actual picture) - a very plausible explanation for "missing
+      // picture in access unit" warnings seen downstream (confirmed via
+      // a real HomeKit plugin log showing this exact warning from
+      // Scrypted's own ffmpeg reading our muxed output). Removed.
+
+      let corruptionDetected = false;
+      let flushed = false;
+      let bufferedChunks: Buffer[] = [];
+      const flush = () => {
+        if (flushed) return;
+        flushed = true;
+        clearTimeout(detectionTimer);
+        for (const c of bufferedChunks) {
+          if (!socket.destroyed) socket.write(c);
+        }
+        bufferedChunks = [];
+      };
+      const detectionTimer = setTimeout(flush, CORRUPTION_DETECTION_WINDOW_MS);
+
+      let firstChunkLogged = false;
+      proc.stdout.on("data", (chunk: Buffer) => {
+        if (!firstChunkLogged) {
+          const latencyMs = Date.now() - spawnTime;
+          this.logger.info(
+            `H.265 transcode pipeline emitting fMP4 (attempt ${attempt}, first chunk: ${chunk.length} bytes, ${latencyMs}ms after spawn)`,
+          );
+          firstChunkLogged = true;
+        }
+        if (flushed) {
+          if (!socket.destroyed) socket.write(chunk);
+        } else if (!corruptionDetected) {
+          bufferedChunks.push(chunk);
+        }
+      });
+
+      let stderrTail = "";
+      proc.stderr.on("data", (chunk: Buffer) => {
+        const text = chunk.toString();
+        stderrTail = (stderrTail + text).slice(-4000);
+        this.logger.warn(`Transcode ffmpeg stderr: ${text.trim()}`);
+
+        if (!flushed && !corruptionDetected && CORRUPTION_PATTERN.test(text)) {
+          corruptionDetected = true;
+          clearTimeout(detectionTimer);
+          try {
+            proc.kill("SIGKILL");
+          } catch (e) {
+            this.logger.warn(
+              `Transcode process kill threw during corruption retry: ${e}`,
+            );
+          }
+          if (attempt < MAX_TRANSCODE_ATTEMPTS) {
+            this.logger.warn(
+              `Detected corrupt cold-start access unit (attempt ${attempt}/${MAX_TRANSCODE_ATTEMPTS}) - respawning transparently for the same client`,
+            );
+            spawnAttempt(attempt + 1);
+          } else {
+            this.logger.warn(
+              `Corrupt cold-start access unit persisted after ${MAX_TRANSCODE_ATTEMPTS} attempts - forwarding anyway as a last resort`,
+            );
+            flush();
+          }
+        }
+      });
+
+      proc.on("error", (err) => {
+        this.logger.warn(`Transcode ffmpeg process error: ${err.message}`);
+      });
+      proc.on("exit", (code, signal) => {
+        if (code !== 0 && code !== null && !corruptionDetected) {
+          this.logger.warn(
+            `Transcode ffmpeg exited with code ${code} (signal ${signal}). Last stderr: ${stderrTail}`,
+          );
+        }
+      });
+
+      // Always (re)point the map entry at whichever process is
+      // currently live, so cleanup() below always kills the right one
+      // regardless of how many retries have happened - including the
+      // very first attempt, where this is the initial registration.
+      this.muxerStreams.set(socket, {
+        kind: "transcode",
+        proc,
+        videoPipe,
+        audioPipe,
+      });
+    };
+
+    spawnAttempt(1);
+
+    this.logger.info(
+      `Muxed client attached via H.265 transcode (total active muxers: ${this.muxerStreams.size})`,
+    );
+
+    this.updateLivestreamStateForMuxerClients();
+
+    const cleanup = () => {
+      const entry = this.muxerStreams.get(socket);
+      if (!entry) return;
+      this.muxerStreams.delete(socket);
+      try {
+        if (entry.kind === "transcode") entry.proc.kill("SIGKILL");
+      } catch (e) {
+        this.logger.warn(`Transcode process kill threw during cleanup: ${e}`);
       }
       this.logger.info(
         `Muxed client detached (total active muxers: ${this.muxerStreams.size})`,
@@ -741,6 +1255,20 @@ export class StreamServer extends EventEmitter {
   }
 
   /**
+   * See IStreamServer.setNextTranscodeOptions. Consumed once by
+   * attachTranscodeClient on the next muxed connection, then cleared.
+   */
+  setNextTranscodeOptions(opts: {
+    bitrate?: number;
+    width?: number;
+    height?: number;
+    fps?: number;
+    profile?: string;
+  }): void {
+    this.nextTranscodeOptions = opts;
+  }
+
+  /**
    * Stop the TCP server
    */
   async stop(): Promise<void> {
@@ -777,12 +1305,16 @@ export class StreamServer extends EventEmitter {
       this.logger.debug("WebSocket audio event listener removed");
     }
 
-    // Tear down all in-process muxers and disconnect their clients
-    for (const [socket, { muxer }] of this.muxerStreams) {
+    // Tear down all in-process muxers/transcode processes and disconnect clients
+    for (const [socket, entry] of this.muxerStreams) {
       try {
-        muxer.destroy();
+        if (entry.kind === "jmuxer") {
+          entry.muxer.destroy();
+        } else {
+          entry.proc.kill("SIGKILL");
+        }
       } catch (e) {
-        this.logger.warn(`JMuxer destroy threw during shutdown: ${e}`);
+        this.logger.warn(`Muxer/transcode cleanup threw during shutdown: ${e}`);
       }
       if (!socket.destroyed) socket.destroy();
     }
