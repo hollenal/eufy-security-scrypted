@@ -814,6 +814,19 @@ export class StreamServer extends EventEmitter {
     // absence means fall back to software.
     const hasV4l2m2mEncoder = fs.existsSync("/dev/video11");
 
+    // The Pi 4's dedicated HEVC decoder (rpi-hevc-dec), reached through
+    // ffmpeg's drm hwaccel (V4L2 stateless/request API). Software-decoding
+    // the camera's 2880x1616 HEVC was the single biggest CPU cost of this
+    // pipeline - measured at ~60% of it - and running near 0.95x realtime
+    // starves the event loop enough to lose P2P datagrams. Output is
+    // bit-identical to the software decoder (SSIM 1.0, including across
+    // the camera's mid-stream resolution changes). Frames are downloaded
+    // to system memory for the software scaler: the ISP scaler
+    // (scale_v4l2m2m) cannot take this decoder's 2-object SAND buffers.
+    // ffmpeg falls back to software decode if hwaccel setup fails.
+    const hasHevcHwDecoder = fs.existsSync("/dev/video19");
+    const decoderArgs = hasHevcHwDecoder ? ["-hwaccel", "drm"] : [];
+
     // The camera's native resolution is 2880x1616 (confirmed via captured
     // metadata). libx264 handles that fine, but the Pi 4's hardware H.264
     // encoder does not - confirmed directly via ffmpeg stderr: it accepts
@@ -974,7 +987,7 @@ export class StreamServer extends EventEmitter {
     const extraMuxArgs = hasV4l2m2mEncoder ? ["-frag_duration", "200000"] : [];
 
     this.logger.info(
-      `H.265 transcode using ${hasV4l2m2mEncoder ? "hardware (h264_v4l2m2m)" : "software (libx264)"} H.264 encoder`,
+      `H.265 transcode using ${hasHevcHwDecoder ? "hardware (drm hwaccel)" : "software"} HEVC decoder, ${hasV4l2m2mEncoder ? "hardware (h264_v4l2m2m)" : "software (libx264)"} H.264 encoder`,
     );
 
     // The async hardware encoder pipeline occasionally (probabilistically,
@@ -1026,6 +1039,7 @@ export class StreamServer extends EventEmitter {
           "32",
           "-framerate",
           String(videoFps),
+          ...decoderArgs,
           "-f",
           "hevc",
           "-i",
