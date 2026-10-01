@@ -1077,6 +1077,17 @@ export class StreamServer extends EventEmitter {
         { stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"] },
       ) as ChildProcessWithoutNullStreams;
 
+      // fd 3/4 are opened by Node as duplex sockets, so once cleanup()
+      // SIGKILLs ffmpeg they can emit EPIPE/ECONNRESET. Without a listener
+      // that 'error' is unhandled and takes down the whole process.
+      proc.stdio.forEach((stream, fd) => {
+        (stream as NodeJS.EventEmitter | null)?.on("error", (err: Error) => {
+          this.logger.debug(
+            `Transcode ffmpeg fd ${fd} error (ignored): ${err.message}`,
+          );
+        });
+      });
+
       const rawVideoPipe = proc.stdio[3] as NodeJS.WritableStream;
       const audioPipe = proc.stdio[4] as NodeJS.WritableStream;
 
